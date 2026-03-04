@@ -2,20 +2,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Системные зависимости для Pillow и torch
+# РЎРёСЃС‚РµРјРЅС‹Рµ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё РґР»СЏ Pillow Рё torch
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Зависимости отдельным слоем для кэширования
+# Р—Р°РІРёСЃРёРјРѕСЃС‚Рё РѕС‚РґРµР»СЊРЅС‹Рј СЃР»РѕРµРј РґР»СЏ РєСЌС€РёСЂРѕРІР°РЅРёСЏ
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY doll_server.py .
 
-# Порт по умолчанию для HF Spaces и Render
+# РџРѕСЂС‚ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ РґР»СЏ HF Spaces Рё Render
 ENV PORT=7860
 
 EXPOSE 7860
