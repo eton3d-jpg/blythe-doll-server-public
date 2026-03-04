@@ -1,20 +1,11 @@
-# Web-сервер
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
-
-# ML
 torch==2.3.1
 diffusers==0.29.2
 transformers==4.42.4
 accelerate==0.31.0
 safetensors==0.4.3
-
-# Изображения
 pillow==10.4.0
-
-# Async HTTP (заменяет requests для async-кода)
 httpx==0.27.0
-
-# Системные
 psutil==5.9.8
