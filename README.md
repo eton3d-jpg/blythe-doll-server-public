@@ -1,3 +1,12 @@
+---
+title: Blythello
+emoji: 🎀
+colorFrom: pink
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
 # Blythello
 
 Blythe Doll Generator — преобразование фотографий в стиль куклы Blythe с помощью Stable Diffusion.
