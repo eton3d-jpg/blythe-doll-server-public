@@ -355,11 +355,8 @@ def load_pipeline(
         pipe.enable_attention_slicing()
         logger.info("✂️ Attention slicing включён")
 
-    if device == "cpu":
-        pipe.enable_sequential_cpu_offload()
-        logger.info("🔄 Sequential CPU offload включён")
-    else:
-        pipe = pipe.to(device)
+    pipe = pipe.to(device)
+    logger.info(f"🔄 Модель загружена на {device}")
 
     logger.info(f"✅ Модель загружена за {time.time() - t0:.1f} сек")
     return pipe, device, model_id
