@@ -27,7 +27,7 @@ import hashlib
 import asyncio
 from contextlib import asynccontextmanager, nullcontext
 from typing import Optional, Dict, Any
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
@@ -51,6 +51,8 @@ try:
     from diffusers import StableDiffusionImg2ImgPipeline
     from transformers import logging as hf_logging
     import psutil
+    import numpy as np
+    import cv2
 except ImportError as e:
     print(f"❌ Ошибка импорта: {e}")
     print("Установи зависимости: pip install -r requirements.txt")
@@ -109,6 +111,15 @@ class Config:
     # Heartbeat (для Render/HF)
     HEARTBEAT_URL = os.environ.get("HEARTBEAT_URL", "")
     HEARTBEAT_INTERVAL = 240  # 4 минуты
+
+    # Защита
+    MIN_IMAGE_SIZE_PX = 100          # минимум 100x100 пикселей
+    REQUIRE_FACE = True              # требовать наличие лица
+    FACE_CONFIDENCE = 1.1            # параметр scaleFactor для detectMultiScale
+    RATE_LIMIT_REQUESTS = 3          # максимум запросов
+    RATE_LIMIT_WINDOW = 60           # за N секунд
+    MAX_REQUESTS_PER_DAY = 20        # лимит в день на IP
+    ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/jpg"}
 
 
 # ==================== СТИЛИ ====================
@@ -211,6 +222,89 @@ class ResultCache:
         return len(self.cache)
 
 
+# ==================== RATE LIMITER ====================
+class RateLimiter:
+    """Rate limiter по IP: N запросов за M секунд + дневной лимит"""
+
+    def __init__(self):
+        self._minute: Dict[str, list] = defaultdict(list)
+        self._daily:  Dict[str, list] = defaultdict(list)
+
+    def check(self, ip: str) -> Optional[str]:
+        now = time.time()
+
+        # Чистим старые записи
+        self._minute[ip] = [t for t in self._minute[ip] if now - t < Config.RATE_LIMIT_WINDOW]
+        self._daily[ip]  = [t for t in self._daily[ip]  if now - t < 86400]
+
+        if len(self._minute[ip]) >= Config.RATE_LIMIT_REQUESTS:
+            wait = int(Config.RATE_LIMIT_WINDOW - (now - self._minute[ip][0]))
+            return f"Слишком много запросов. Подождите {wait} секунд."
+
+        if len(self._daily[ip]) >= Config.MAX_REQUESTS_PER_DAY:
+            return f"Достигнут дневной лимит ({Config.MAX_REQUESTS_PER_DAY} запросов). Попробуйте завтра."
+
+        self._minute[ip].append(now)
+        self._daily[ip].append(now)
+        return None
+
+
+# ==================== ВАЛИДАТОР ИЗОБРАЖЕНИЙ ====================
+class ImageValidator:
+    """Проверка изображения: формат, размер, наличие лица"""
+
+    _face_cascade = None
+
+    @classmethod
+    def _get_cascade(cls):
+        if cls._face_cascade is None:
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            cls._face_cascade = cv2.CascadeClassifier(cascade_path)
+        return cls._face_cascade
+
+    @classmethod
+    def validate(cls, contents: bytes, filename: str = "") -> Optional[str]:
+        """Возвращает строку с ошибкой или None если всё ок"""
+
+        # 1. Проверка формата файла
+        try:
+            img = Image.open(io.BytesIO(contents))
+            img.load()
+        except Exception:
+            return "Неверный формат файла. Загрузите JPEG или PNG."
+
+        fmt = img.format or ""
+        if fmt.upper() not in ("JPEG", "JPG", "PNG"):
+            return f"Формат {fmt} не поддерживается. Только JPEG и PNG."
+
+        # 2. Проверка минимального размера
+        w, h = img.size
+        if w < Config.MIN_IMAGE_SIZE_PX or h < Config.MIN_IMAGE_SIZE_PX:
+            return f"Изображение слишком маленькое ({w}x{h}px). Минимум {Config.MIN_IMAGE_SIZE_PX}x{Config.MIN_IMAGE_SIZE_PX}px."
+
+        # 3. Проверка что изображение не однотонное (пустое)
+        img_rgb = img.convert("RGB")
+        arr = np.array(img_rgb)
+        std = float(arr.std())
+        if std < 5.0:
+            return "Изображение слишком однотонное. Загрузите чёткое фото."
+
+        # 4. Проверка наличия лица (если включено)
+        if Config.REQUIRE_FACE:
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            cascade = cls._get_cascade()
+            faces = cascade.detectMultiScale(
+                gray,
+                scaleFactor=Config.FACE_CONFIDENCE,
+                minNeighbors=4,
+                minSize=(30, 30),
+            )
+            if len(faces) == 0:
+                return "Лицо не обнаружено на фото. Пожалуйста, загрузите чёткое фото лица."
+
+        return None
+
+
 # ==================== ОЧЕРЕДЬ ЗАДАЧ ====================
 class TaskQueue:
     """Асинхронная очередь задач с воркером"""
@@ -291,6 +385,8 @@ pipeline_state: Dict[str, Any] = {
 
 cache = ResultCache()
 task_queue = TaskQueue()
+rate_limiter = RateLimiter()
+image_validator = ImageValidator()
 
 
 # ==================== ОПРЕДЕЛЕНИЕ УСТРОЙСТВА ====================
@@ -355,8 +451,11 @@ def load_pipeline(
         pipe.enable_attention_slicing()
         logger.info("✂️ Attention slicing включён")
 
-    pipe = pipe.to(device)
-    logger.info(f"🔄 Модель загружена на {device}")
+    if device == "cpu":
+        pipe = pipe.to("cpu")
+        logger.info("🔄 Модель загружена на CPU")
+    else:
+        pipe = pipe.to(device)
 
     logger.info(f"✅ Модель загружена за {time.time() - t0:.1f} сек")
     return pipe, device, model_id
@@ -660,6 +759,7 @@ async def get_result(task_id: str):
 
 @app.post("/generate")
 async def generate(
+    request: Request,
     file: UploadFile = File(...),
     style: str = Form("blythe"),
     steps: int = Form(Config.DEFAULT_STEPS),
@@ -667,6 +767,12 @@ async def generate(
     guidance: float = Form(Config.DEFAULT_GUIDANCE),
 ):
     """Принять фото и вернуть стилизованное изображение (или task_id если занято)"""
+
+    # Rate limiting по IP
+    ip = request.client.host if request.client else "unknown"
+    rate_error = rate_limiter.check(ip)
+    if rate_error:
+        raise HTTPException(status_code=429, detail=rate_error)
 
     if not pipeline_state["ready"] or pipeline_state["pipe"] is None:
         return JSONResponse(
@@ -698,12 +804,15 @@ async def generate(
     if len(contents) > Config.MAX_FILE_SIZE_BYTES:
         raise HTTPException(status_code=413, detail=f"Файл слишком большой. Максимум {Config.MAX_FILE_SIZE_MB} МБ")
 
-    # Валидация изображения
+    # Полная валидация изображения (формат + размер + лицо)
+    validation_error = await run_in_threadpool(ImageValidator.validate, contents, file.filename or "")
+    if validation_error:
+        raise HTTPException(status_code=400, detail=validation_error)
+
+    # Открываем изображение для обработки
     try:
         image = Image.open(io.BytesIO(contents))
         image.load()
-    except UnidentifiedImageError:
-        raise HTTPException(status_code=400, detail="Неверный формат файла. Ожидается JPEG или PNG")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Ошибка чтения изображения: {e}")
 
